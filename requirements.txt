@@ -1,0 +1,15 @@
+# PulseGuard AI Requirements
+# Based on specs.md Section 2: Tech Stack & Version Constraints
+
+streamlit>=1.30.0
+scikit-learn>=1.4.0
+plotly>=5.18.0
+google-genai>=0.3.0
+numpy>=1.26.0
+scipy>=1.11.0
+pytest>=8.0.0
+black>=24.0.0
+flake8>=7.0.0
+
+# Development dependencies
+# Using -e .[dev] would include these

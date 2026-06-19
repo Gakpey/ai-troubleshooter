@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulseguard-ai"
+version = "0.1.0"
+description = "PulseGuard AI - Real-time reactive pipeline for R&S waveform analysis"
+authors = [
+    {name = "Joshua Gakpey-Lawson"},
+]
+dependencies = [
+    "streamlit>=1.30.0",
+    "scikit-learn>=1.4.0",
+    "plotly>=5.18.0",
+    "google-genai>=0.3.0",
+    "numpy>=1.26.0",
+    "scipy>=1.11.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "black>=24.0.0",
+    "flake8>=7.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/ai-troubleshooter"
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = [
+    "E203",  # Whitespace before ':' ignored by black
+    "W503",  # Line break before binary operator ignored by black
+]
