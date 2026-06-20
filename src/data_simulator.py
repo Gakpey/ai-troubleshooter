@@ -8,8 +8,30 @@ Implements full mathematical fidelity per specs.md sections 3.1, 3.5, and 3.6.
 import numpy as np
 from typing import Tuple, Optional, Dict, Any
 import streamlit as st
-from scipy import signal
-from config import *
+from config import (
+    DEFAULT_FREQUENCY,
+    DEFAULT_AMPLITUDE,
+    DEFAULT_OFFSET,
+    DEFAULT_SAMPLE_RATE,
+    DEFAULT_DURATION,
+    DEFAULT_RISE_TIME_TARGET,
+    DEFAULT_IMPEDANCE_MISMATCH,
+    DEFAULT_NOISE_FLOOR,
+    TWO_PI,
+    RISE_TIME_CONSTANT,
+    PROBE_COMPENSATION_RISE_TIME_MULTIPLIER,
+    ADC_BITS,
+    THERMAL_DRIFT_COEFFICIENT,
+    THERMAL_WARMUP_TIME,
+    SCPI_CALIBRATION_INTERVAL,
+    VNA_DEFAULT_DIRECTIVITY,
+    VNA_DEFAULT_SOURCE_MATCH,
+    RISE_TIME_LOW_THRESHOLD,
+    RISE_TIME_HIGH_THRESHOLD,
+    map_noise_floor_to_std,
+    get_ch2_dc_level,
+    calculate_rise_time_tau,
+)
 
 # =============================================================================
 # CORE SIGNAL GENERATION FUNCTIONS
@@ -177,50 +199,72 @@ def apply_impedance_mismatch(
     if ringing_amplitude <= 0 or len(voltage_array) < 2:
         return modified_array
 
-    # Detect rising edges (transition from low to high state)
-    # For square wave, find where signal crosses the midpoint going positive
-    midpoint = np.mean(voltage_array)  # Approximate midpoint
-    # Better approach: find where derivative is positive and significant
-    diff_signal = np.diff(voltage_array)
-    # Using a threshold based on signal standard deviation
-    edge_threshold = 0.1 * np.std(diff_signal) if np.std(diff_signal) > 0 else 0.01
-    rising_edges = np.where(
-        (diff_signal[:-1] <= edge_threshold) & (diff_signal[1:] > edge_threshold)
+    # Estimate settled high and low levels from the signal
+    # Use percentiles to avoid extremes due to existing ringing or noise
+    sorted_v = np.sort(voltage_array)
+    settled_low = sorted_v[int(0.1 * len(sorted_v))]
+    settled_high = sorted_v[int(0.9 * len(sorted_v))]
+    amplitude = settled_high - settled_low
+
+    if amplitude <= 0:
+        return modified_array
+
+    # Detect rising edges using 90% threshold crossing
+    v_low_thresh = settled_low + 0.1 * amplitude  # 10% point
+    v_high_thresh = settled_low + 0.9 * amplitude  # 90% point
+
+    # Find rising edges: crossing of 10% threshold going up
+    low_crossings = np.where(
+        (voltage_array[:-1] <= v_low_thresh) & (voltage_array[1:] > v_low_thresh)
+    )[0]
+    # Find rising edges: crossing of 90% threshold going up
+    high_crossings = np.where(
+        (voltage_array[:-1] <= v_high_thresh) & (voltage_array[1:] > v_high_thresh)
     )[0]
 
-    # Alternative: find zero crossings for cleaner detection
-    if len(rising_edges) == 0:
-        # Fallback to zero-crossing method
-        centered_signal = voltage_array - np.mean(voltage_array)
-        rising_edges = np.where(
-            (centered_signal[:-1] <= 0) & (centered_signal[1:] > 0)
-        )[0]
+    if len(low_crossings) == 0 or len(high_crossings) == 0:
+        return modified_array
+
+    # Time step
+    dt = time_array[1] - time_array[0]
+    # Window after 90% point to search for peak (150 ns)
+    window_time = 150.0e-9
+    window_samples = max(1, int(window_time / dt))
 
     # For each rising edge, add damped ringing
-    for edge_idx in rising_edges:
-        if edge_idx < len(voltage_array):
-            # Calculate time relative to edge start
-            t_rel = time_array[edge_idx:] - time_array[edge_idx]
+    for low_idx in low_crossings:
+        # Find the first high crossing after this low crossing
+        high_after = high_crossings[high_crossings > low_idx]
+        if len(high_after) == 0:
+            continue
+        high_idx = high_after[0]
 
-            # Limit ringing to a reasonable duration (e.g., 5 periods of ringing frequency)
-            if ringing_frequency > 0:
-                max_ring_time = 5.0 / ringing_frequency
-            else:
-                max_ring_time = 1e-6  # 1 microsecond fallback
+        # Calculate time relative to the 90% crossing point
+        t_rel = time_array[high_idx:] - time_array[high_idx]
 
-            ring_samples = min(
-                int(max_ring_time / (time_array[1] - time_array[0])), len(t_rel)
+        # Limit ringing to a reasonable duration (e.g., 5 periods of ringing frequency)
+        if ringing_frequency > 0:
+            max_ring_time = 5.0 / ringing_frequency
+        else:
+            max_ring_time = 1e-6  # 1 microsecond fallback
+
+        ring_samples = min(
+            int(max_ring_time / dt), len(t_rel)
+        )
+
+        if ring_samples > 0:
+            t_rel = t_rel[:ring_samples]
+            # Damped ringing: A * exp(-t/τ) * cos(2π * f_ring * t)
+            # Scale ringing_amplitude to achieve desired overshoot
+            # At impedance_mismatch=1.0, we want overshoot of 15-25%
+            # We'll use a scaling factor of 0.2 (20%) of amplitude
+            effective_amplitude = ringing_amplitude * 0.2 * amplitude
+            ringing = (
+                effective_amplitude
+                * np.exp(-t_rel / decay_constant)
+                * np.cos(TWO_PI * ringing_frequency * t_rel)
             )
-
-            if ring_samples > 0:
-                t_rel = t_rel[:ring_samples]
-                # Damped ringing: A * exp(-t/τ) * cos(2π * f_ring * t)
-                ringing = (
-                    ringing_amplitude
-                    * np.exp(-t_rel / decay_constant)
-                    * np.cos(TWO_PI * ringing_frequency * t_rel)
-                )
-                modified_array[edge_idx : edge_idx + ring_samples] += ringing
+            modified_array[high_idx : high_idx + ring_samples] += ringing
 
     return modified_array
 
@@ -905,20 +949,20 @@ def simulate_signals(
     # Apply Fault Profile 1: Impedance Mismatch
     if impedance_mismatch > 0:
         # Calculate ringing frequency (typically much higher than carrier)
-        ringing_freq = frequency * 10.0  # 10x carrier frequency as example
-        decay_const = 1.0 / (ringing_freq * 5.0)  # Decay over ~5 periods
+        ringing_freq = frequency * 20.0  # 20x carrier frequency for faster ringing
+        decay_const = 1.0 / (ringing_freq * 4.0)  # Decay over ~4 periods for visible overshoot
+        # Scale impedance_mismatch to get sufficient overshoot for detection
+        scaled_amplitude = impedance_mismatch * 3.0  # Empirical scaling factor
         ch1_voltage = apply_impedance_mismatch(
             ch1_voltage,
             ch1_time,
-            ringing_amplitude=impedance_mismatch,
+            ringing_amplitude=scaled_amplitude,
             ringing_frequency=ringing_freq,
             decay_constant=decay_const,
         )
 
     # Apply Fault Profile 2: Power Supply Instability
-    if (
-        noise_std > 0 or impedance_mismatch > 0
-    ):  # Also apply some AC ripple with impedance mismatch
+    if noise_std > 0:  # Only apply if there is noise from the Noise Floor slider
         ac_amp = 0.01 + 0.04 * impedance_mismatch if impedance_mismatch > 0 else 0.01
         ch2_voltage = apply_power_supply_instability(
             ch2_voltage,

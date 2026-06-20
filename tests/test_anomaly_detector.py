@@ -87,6 +87,27 @@ def generate_rise_time_signal():
     )
 
 
+def generate_ch2_dc_level_error_signal():
+    """Generate a signal with incorrect CH2 DC level."""
+    # Create a signal with offset=0V (should give CH2=3.3V)
+    # but manually set CH2 to 5.0V to create a DC level error
+    signal = simulate_signals(
+        frequency=DEFAULT_FREQUENCY,
+        amplitude=DEFAULT_AMPLITUDE,
+        offset=0.0,  # Near zero offset -> CH2 should be 3.3V
+        impedance_mismatch=DEFAULT_IMPEDANCE_MISMATCH,
+        noise_floor=DEFAULT_NOISE_FLOOR,
+        rise_time_target=DEFAULT_RISE_TIME_TARGET,
+        sample_rate=DEFAULT_SAMPLE_RATE,
+        duration=DEFAULT_DURATION,
+        virtual_uptime=0.0,
+    )
+    # Manually override CH2 to be at wrong level (5.0V instead of 3.3V)
+    # This creates a DC level error of approximately 1.7V
+    signal["ch2_voltage"] = np.full_like(signal["ch2_voltage"], 5.0)
+    return signal
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -110,7 +131,7 @@ class TestAnomalyDetectorInit:
     def test_initialization(self):
         detector = AnomalyDetector()
         assert detector.contamination == 0.03
-        assert detector.n_estimators == 100
+        assert detector.n_estimators == 50
         assert detector.random_state == 42
         assert detector.window_size == 10
         assert detector._isolation_forest is not None
@@ -305,6 +326,24 @@ class TestPerformance:
         # Full 250ms budget for combined sim+detect; detector alone <150ms
         assert elapsed < 0.150, f"Detection took {elapsed*1000:.1f}ms"
         assert "is_fault" in result
+
+
+class TestCh2DCLevelErrorDetection:
+    def test_ch2_dc_level_error_triggers_fault(self):
+        """Signal with incorrect CH2 DC level should trigger fault."""
+        detector = AnomalyDetector()
+        signal = generate_ch2_dc_level_error_signal()
+        result = detector.detect_anomalies(
+            ch1_time=signal["ch1_time"],
+            ch1_voltage=signal["ch1_voltage"],
+            ch2_time=signal["ch2_time"],
+            ch2_voltage=signal["ch2_voltage"],
+            params=_default_params(),
+        )
+        assert result["is_fault"] is True
+        assert "ch2_dc_level_error_exceeded" in result["fault_reasons"]
+        # The error should be approximately 1.7V (5.0V - 3.3V)
+        assert result["computed_metrics"]["ch2"]["dc_level_error"] > 1.0
 
 
 if __name__ == "__main__":

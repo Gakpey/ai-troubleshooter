@@ -48,6 +48,7 @@ RISE_TIME_HIGH_THRESHOLD = 0.9  # 90%
 IMPEDANCE_MISMATCH_OVERSHOOT_THRESHOLD = 0.10  # > 10%
 POWER_SUPPLI_VPP_THRESHOLD = 0.10  # > 100mV
 PROBE_COMPENSATION_RISE_TIME_MULTIPLIER = 1.2  # > 1.2 × target
+CH2_DC_LEVEL_ERROR_THRESHOLD = 0.15  # > 150mV error in CH2 DC level
 
 # =============================================================================
 # STREAMLIT WIDGET MAPPING

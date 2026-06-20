@@ -23,6 +23,7 @@ import numpy as np
 from typing import Dict, Any, Optional
 from sklearn.ensemble import IsolationForest
 import logging
+from config import get_ch2_dc_level
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +44,14 @@ class AnomalyDetector:
         Size of rolling window for variance feature (in samples).
     """
 
+    # Class-level cache for the Isolation Forest model (fitted on baseline normal signal)
+    _isolation_forest: Optional[IsolationForest] = None
+    _fitted: bool = False
+
     def __init__(
         self,
         contamination: float = 0.03,
-        n_estimators: int = 100,
+        n_estimators: int = 50,
         random_state: int = 42,
         window_size: int = 10,
     ):
@@ -68,11 +73,13 @@ class AnomalyDetector:
             IMPEDANCE_MISMATCH_OVERSHOOT_THRESHOLD,
             POWER_SUPPLI_VPP_THRESHOLD,
             PROBE_COMPENSATION_RISE_TIME_MULTIPLIER,
+            CH2_DC_LEVEL_ERROR_THRESHOLD,
         )
 
         self.overshoot_threshold = IMPEDANCE_MISMATCH_OVERSHOOT_THRESHOLD
         self.vpp_threshold = POWER_SUPPLI_VPP_THRESHOLD
         self.rise_time_multiplier = PROBE_COMPENSATION_RISE_TIME_MULTIPLIER
+        self.ch2_dc_level_error_threshold = CH2_DC_LEVEL_ERROR_THRESHOLD
 
         # Store defaults for baseline generation
         self._default_freq = DEFAULT_FREQUENCY
@@ -84,15 +91,16 @@ class AnomalyDetector:
         self._default_impedance_mismatch = DEFAULT_IMPEDANCE_MISMATCH
         self._default_noise_floor = DEFAULT_NOISE_FLOOR
 
-        # Isolation Forest model (fitted on baseline normal signal)
-        self._isolation_forest: Optional[IsolationForest] = None
         # Cache for the last feature vector (for debugging/inspection)
         self._last_feature_vector: Optional[np.ndarray] = None
-        # Flag to indicate if model has been fitted
-        self._fitted: bool = False
 
-        # Fit the model on a baseline normal signal
-        self._fit_baseline_model()
+        # Fit the model on a baseline normal signal (only once per class)
+        if not AnomalyDetector._fitted:
+            AnomalyDetector._isolation_forest = self._fit_baseline_model()
+            AnomalyDetector._fitted = True
+
+        # Use the cached model
+        self._isolation_forest = AnomalyDetector._isolation_forest
 
     def _generate_baseline_signal(self) -> Dict[str, np.ndarray]:
         """Generate a baseline normal signal with default parameters and no faults."""
@@ -110,22 +118,22 @@ class AnomalyDetector:
             virtual_uptime=0.0,
         )
 
-    def _fit_baseline_model(self) -> None:
+    def _fit_baseline_model(self) -> IsolationForest:
         """Fit the Isolation Forest on a baseline normal signal."""
         baseline = self._generate_baseline_signal()
         ch1_voltage = baseline["ch1_voltage"]
         feature_vector = self._engineer_features(ch1_voltage)
-        self._isolation_forest = IsolationForest(
+        isolation_forest = IsolationForest(
             n_estimators=self.n_estimators,
             contamination=self.contamination,
             random_state=self.random_state,
             n_jobs=-1,
         )
-        self._isolation_forest.fit(feature_vector)
-        self._fitted = True
+        isolation_forest.fit(feature_vector)
         logger.debug(
             "Isolation Forest fitted on baseline %d samples", feature_vector.shape[0]
         )
+        return isolation_forest
 
     def detect_anomalies(
         self,
@@ -176,6 +184,9 @@ class AnomalyDetector:
                     "overshoot_ratio": 0.0,
                     "rise_time": 0.0,
                     "vpp": 0.0,
+                    "dc_level_error": 0.0,
+                    "expected_dc_level": 0.0,
+                    "actual_dc_level": 0.0,
                 },
             },
             "fault_reasons": [],
@@ -212,10 +223,10 @@ class AnomalyDetector:
 
         # Subsample features for fast Isolation Forest inference.
         # For repetitive signals (e.g. 5 MHz square wave over 1 µs),
-        # a representative subsample is sufficient.  Target ~5000 samples.
+        # a representative subsample is sufficient.  Target ~2000 samples.
         fv_len = feature_vector.shape[0]
-        if fv_len > 5000:
-            step = fv_len // 5000
+        if fv_len > 2000:
+            step = fv_len // 2000
             fv_sub = feature_vector[::step]
         else:
             fv_sub = feature_vector
@@ -279,12 +290,21 @@ class AnomalyDetector:
         voltage_array: np.ndarray,
         params: Dict[str, Any],
     ) -> Dict[str, float]:
-        """Compute CH2-specific metrics: Vpp only."""
+        """Compute CH2-specific metrics: Vpp and DC level error."""
         vpp = float(np.ptp(voltage_array))
+        # Calculate DC level error: difference between actual mean and expected level
+        offset = float(params.get("offset", self._default_offset))
+        expected_dc_level = get_ch2_dc_level(offset)
+        actual_dc_level = float(np.mean(voltage_array))
+        dc_level_error = abs(actual_dc_level - expected_dc_level)
+
         return {
             "overshoot_ratio": 0.0,
             "rise_time": 0.0,
             "vpp": vpp,
+            "dc_level_error": dc_level_error,
+            "expected_dc_level": expected_dc_level,
+            "actual_dc_level": actual_dc_level,
         }
 
     # ------------------------------------------------------------------
@@ -301,67 +321,77 @@ class AnomalyDetector:
         Compute overshoot ratio as localized peak search on logical '1' blocks.
 
         Implements specs.md: Overshoot Ratio = (Vmax - Vhigh) / Vamplitude
+        Threshold for fault detection: Overshoot Ratio > 0.10
 
-        We find each LOW→HIGH transition and search a post-transition window
-        for a voltage peak that exceeds the expected high state.  This catches
-        ringing / overshoot even when ADC quantisation clips the settled region.
+        We find each LOW→HIGH transition (using 10% and 90% thresholds) and
+        search a post-transition window (e.g., next 150-250 samples) for the
+        local maximum voltage. The overshoot is calculated relative to the
+        expected high state from params.
 
-        Uses epsilon = 0.01 * amplitude for hysteresis thresholding.
+        Returns:
+            Overshoot ratio (float)
         """
-        if len(voltage_array) < 2:
+        if len(voltage_array) < 2 or len(time_array) < 2:
             return 0.0
 
-        # Determine expected high/low from params or signal stats
-        if "amplitude" in params and "offset" in params:
-            amplitude = float(params["amplitude"])
-            offset = float(params["offset"])
-            v_high_expected = offset + amplitude / 2.0
-            v_low_expected = offset - amplitude / 2.0
-        else:
-            v_max = np.max(voltage_array)
-            v_min = np.min(voltage_array)
-            v_amplitude = v_max - v_min
-            if v_amplitude > 0:
-                offset = (v_max + v_min) / 2.0
-                amplitude = v_amplitude
-                v_high_expected = offset + amplitude / 2.0
-                v_low_expected = offset - amplitude / 2.0
-            else:
-                return 0.0
+        # Expected high and low from params
+        amplitude = float(params.get("amplitude", self._default_amp))
+        offset = float(params.get("offset", self._default_offset))
+        v_high_expected = offset + amplitude / 2.0
+        v_low_expected = offset - amplitude / 2.0
+        v_amplitude_expected = amplitude  # peak-to-peak
 
-        v_amplitude = float(np.ptp(voltage_array))
-        if v_amplitude <= 0:
+        if v_amplitude_expected <= 0:
             return 0.0
 
-        # Hysteresis thresholds
-        epsilon = 0.01 * amplitude
-        midpoint = (v_high_expected + v_low_expected) / 2.0
-        high_thresh = midpoint + epsilon / 2.0
+        # 10% and 90% thresholds for rise time calculation
+        v_low_thresh = v_low_expected + 0.1 * v_amplitude_expected  # 10% point
+        v_high_thresh = v_low_expected + 0.9 * v_amplitude_expected  # 90% point
 
-        # ---- Vectorised LOW→HIGH transition detection ----
-        lh_indices = (
-            np.where(
-                (voltage_array[:-1] <= high_thresh) & (voltage_array[1:] > high_thresh)
-            )[0]
-            + 1
-        )
+        # Find rising edges: crossing of 10% threshold going up
+        low_crossings = np.where(
+            (voltage_array[:-1] <= v_low_thresh) & (voltage_array[1:] > v_low_thresh)
+        )[0]
+        # Find rising edges: crossing of 90% threshold going up
+        high_crossings = np.where(
+            (voltage_array[:-1] <= v_high_thresh) & (voltage_array[1:] > v_high_thresh)
+        )[0]
 
-        if len(lh_indices) == 0:
+        if len(low_crossings) == 0 or len(high_crossings) == 0:
             return 0.0
 
-        # ---- Post-transition peak search (fast, vectorised) ----
-        # Probe window of 200 samples covers ~200 ns at 1 ns step.
-        probe_window = min(200, len(voltage_array))
         max_overshoot = 0.0
+        # Time step
+        dt = time_array[1] - time_array[0]
+        # Window after 90% point to search for peak (150 ns)
+        window_time = 150.0e-9
+        window_samples = max(1, int(window_time / dt))
 
-        for edge_idx in lh_indices:
-            window_end = min(edge_idx + probe_window, len(voltage_array))
-            peak = float(np.max(voltage_array[edge_idx:window_end]))
-            overshoot = (peak - v_high_expected) / v_amplitude
+        # We'll pair each low crossing with the next high crossing (same edge)
+        for low_idx in low_crossings:
+            # Find the first high crossing after this low crossing
+            high_after = high_crossings[high_crossings > low_idx]
+            if len(high_after) == 0:
+                continue
+            high_idx = high_after[0]
+
+            # Search window for local maximum after the 90% point
+            start_idx = high_idx
+            end_idx = min(len(voltage_array), high_idx + window_samples)
+            if end_idx <= start_idx:
+                continue
+
+            # Find the maximum voltage in the window
+            window_voltage = voltage_array[start_idx:end_idx]
+            local_max = np.max(window_voltage)
+
+            # Overshoot = (local_max - settled_high) / amplitude
+            # Use expected high state as the settled high
+            overshoot = (local_max - v_high_expected) / v_amplitude_expected
             if overshoot > max_overshoot:
                 max_overshoot = overshoot
 
-        return float(max_overshoot)
+        return float(max(max_overshoot, 0.0))  # Ensure non-negative
 
     # ------------------------------------------------------------------
     # Rise time
@@ -377,22 +407,29 @@ class AnomalyDetector:
         Compute rise time as dt between 10% and 90% thresholds.
 
         Uses linear interpolation for sub-sample precision.
+        Uses expected signal levels based on params, not actual min/max,
+        to avoid distortion from faults like overshoot or ringing.
         """
         if len(time_array) < 2 or len(voltage_array) < 2:
             return 0.0
 
-        v_min = float(np.min(voltage_array))
-        v_max = float(np.max(voltage_array))
-        v_range = v_max - v_min
-        if v_range <= 0:
+        # Expected high and low from params
+        amplitude = float(params.get("amplitude", self._default_amp))
+        offset = float(params.get("offset", self._default_offset))
+        v_low_expected = offset - amplitude / 2.0
+        v_high_expected = offset + amplitude / 2.0
+        v_amplitude_expected = amplitude  # peak-to-peak
+
+        if v_amplitude_expected <= 0:
             return 0.0
 
-        v_low = v_min + 0.1 * v_range
-        v_high = v_min + 0.9 * v_range
+        # 10% and 90% thresholds for rise time calculation
+        v_low_thresh = v_low_expected + 0.1 * v_amplitude_expected  # 10% point
+        v_high_thresh = v_low_expected + 0.9 * v_amplitude_expected  # 90% point
 
         # Find first crossing of v_low on rising edge
         low_cross = np.where(
-            (voltage_array[:-1] <= v_low) & (voltage_array[1:] > v_low)
+            (voltage_array[:-1] <= v_low_thresh) & (voltage_array[1:] > v_low_thresh)
         )[0]
         if len(low_cross) == 0:
             return 0.0
@@ -401,7 +438,7 @@ class AnomalyDetector:
 
         # Find first crossing of v_high after first_low
         high_cross = np.where(
-            (voltage_array[:-1] <= v_high) & (voltage_array[1:] > v_high)
+            (voltage_array[:-1] <= v_high_thresh) & (voltage_array[1:] > v_high_thresh)
         )[0]
         high_after = high_cross[high_cross > first_low]
         if len(high_after) == 0:
@@ -412,14 +449,14 @@ class AnomalyDetector:
         # Linear interpolation for precise crossing times
         t_low = float(
             np.interp(
-                v_low,
+                v_low_thresh,
                 [voltage_array[first_low], voltage_array[first_low + 1]],
                 [time_array[first_low], time_array[first_low + 1]],
             )
         )
         t_high = float(
             np.interp(
-                v_high,
+                v_high_thresh,
                 [voltage_array[first_high], voltage_array[first_high + 1]],
                 [time_array[first_high], time_array[first_high + 1]],
             )
@@ -506,6 +543,11 @@ class AnomalyDetector:
         if ch2_metrics["vpp"] > self.vpp_threshold:
             result["is_fault"] = True
             result["fault_reasons"].append("power_supply_vpp_exceeded")
+
+        # CH2 DC level error threshold
+        if ch2_metrics["dc_level_error"] > self.ch2_dc_level_error_threshold:
+            result["is_fault"] = True
+            result["fault_reasons"].append("ch2_dc_level_error_exceeded")
 
         # Rise time threshold on CH1
         target_rise = float(params.get("rise_time_target", self._default_rise))
