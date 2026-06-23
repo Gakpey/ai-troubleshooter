@@ -147,4 +147,4 @@ See `docs/CHANGELOG.md` for detailed release notes.
 This project is proprietary software developed for the R&S Hackathon.
 
 ---
-*Built with ❤️ for the R&S Hackathon by Joshua Gakpey-Lawson & Gemini*
+*Built with ❤️ for the R&S Hackathon by Joshua Gakpey-Lawson & Kwaku Baffour*
